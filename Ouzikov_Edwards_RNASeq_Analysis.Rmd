@@ -1,0 +1,183 @@
+---
+title: "Salmon-Output"
+output: html_document
+date: "2024-04-09"
+---
+## Creating tx2gene  
+```{r}
+library("tximport")
+library("GenomicFeatures")
+library("R.utils")
+library("tidyverse")
+library("AnnotationDbi")
+library("DESeq2")
+library("pheatmap")
+
+#gunzip("gencode.vM29.annotation.gff3.gz")
+
+# Code is from Bioconductor support page
+
+
+txdb = makeTxDbFromGFF(file = "gencode.vM29.annotation.gff3") 
+
+# creating a TxDb object using the annotation file 
+k = keys(txdb, keytype = "TXNAME") # returns all the txnames in the GTF file 
+tx2gene = AnnotationDbi::select(x = txdb, keys = k, columns = "GENEID", keytype = "TXNAME") # returns a dataframe with 1:1 mapping of txname to gene id  
+
+```
+
+## Import quantification data for DESeq2 
+```{r}
+files = c("WT_295_F_quant.sf", "WT_347_M_quant.sf", "WT_L_F_quant.sf", "WT_L2_F_quant.sf", "KO_292_M_quant.sf", "KO_2_M_quant.sf", "KO_3_F_quant.sf", "KO_510_F_quant.sf")
+
+txi = tximport(files, type = "salmon", tx2gene = tx2gene)
+
+write.table(txi$counts, file="Lrig1_WT_KO_Counts.txt", quote=FALSE, sep="\t", row.names=TRUE, col.names=TRUE)
+
+```
+
+## Making a DESeq object
+```{r}
+condition = factor(c("WT", "WT", "WT", "WT", "KO", "KO", "KO", "KO")) # the control level must be the first level
+sex = factor(c("female", "male", "female", "female", "male", "male", "female", "female"))
+samples = data.frame(row.names = files, condition = condition, sex = sex)
+
+ddsTxi = DESeqDataSetFromTximport(txi, colData = samples, design = ~ sex + condition) # variable of interest must be at the end of the formula 
+```
+
+## Pre-filtering
+```{r}
+keep <- rowSums(counts(ddsTxi)) >= 10
+ddsTxi <- ddsTxi[keep,]
+```
+
+## Specifying the reference level before running differential expression analysis 
+```{r}
+ddsTxi$condition = relevel(ddsTxi$condition, ref = "WT")
+```
+
+## Differential expression analysis
+```{r}
+ddsTxi = DESeq(ddsTxi)
+res = results(ddsTxi)
+#res
+```
+
+## Log fold shrinkage for visualization (heat map)
+```{r}
+resultsNames(ddsTxi)
+resLFC = lfcShrink(ddsTxi, coef="condition_KO_vs_WT", type="apeglm")
+resLFC
+```
+
+## Ordering the results table by p-value
+```{r}
+#Order results by p-value
+resOrdered = res[order(res$pvalue),]
+```
+
+## Subsetting the results
+```{r}
+resSig = subset(resOrdered, padj < 0.1)
+resSig
+```
+
+
+## Export the data
+```{r}
+write.csv(as.data.frame(resSig), file="condition_WTvsKO+gender_results.csv")
+```
+
+## Getting Gene symbols for heat map visualization
+```{r}
+# Order results by the shrunken log fold change values for heat map 
+resOrdered_lfc = resLFC[order(resLFC$log2FoldChange),]
+summary(resOrdered)
+resSig_lfc = subset(resOrdered_lfc, padj < 0.1)
+
+resSig_lfc_df = as.data.frame(resSig_lfc)
+gene_ids = rownames(resSig_lfc_df)
+# removing the version ID to fetch the gene names
+library("GeneStructureTools")
+genes = removeVersion(gene_ids)
+
+library("biomaRt")
+ensembl = useEnsembl(biomart = "genes")
+datasets = listDatasets(ensembl)
+mart = useMart("ensembl", dataset = "mmusculus_gene_ensembl")
+attributes = listAttributes(mart)
+filters = listFilters(mart)
+gene_names = getBM(attributes = c("ensembl_gene_id", "external_gene_name"), filters = "ensembl_gene_id", values = genes, mart = mart)
+
+resSig_lfc_df$gene_ids = genes
+resSig_lfc_df$gene_symbol = gene_names[match(resSig_lfc_df[,6], gene_names[,1]),2] 
+```
+
+
+# Heat Map (averaged and non-averaged)
+```{r}
+norm_data = counts(ddsTxi, normalized = T)
+#which(row.names(norm_data) == "ENSMUSG00000030029.15")
+top_35 = c(rownames(resSig_lfc_df[1:25,]), rownames(tail(resSig_lfc_df, n = 10)))
+top_35_genes = c(resSig_lfc_df[1:25,7], tail(resSig_lfc_df, n = 10)[,7])
+top_35_norm = norm_data[top_35,]
+top_35_norm = log2(top_35_norm +1)
+WT_avg = rowMeans(top_35_norm[,1:4])
+KO_avg = rowMeans(top_35_norm[, 5:8])
+heatmap = data.frame(WT = WT_avg, KO = KO_avg)
+
+pdf("WT_vs_KO_average_heatmap.pdf")
+pheatmap(heatmap, cluster_cols = F, cluster_rows = T, labels_row = top_35_genes, labels_col = c("WT", "KO"), angle_col = 0, main = "Heatmap of Wild Type vs LRIG1 Knock Out")
+dev.off()
+
+pdf("WT_vs_KO_heatmap.pdf")
+pheatmap(top_35_norm, cluster_cols = F, cluster_rows = T, labels_row = top_35_genes, labels_col = c("WT", "WT", "WT", "WT", "KO", "KO", "KO", "KO"), angle_col = 0, main = "Heatmap of Wild Type vs LRIG1 Knock Out")
+dev.off()
+```
+
+
+## Getting all gene symbols for volcano plot
+```{r}
+res_df = as.data.frame(res)
+gene_ids_all = rownames(res_df)
+genes_all = removeVersion(gene_ids_all)
+gene_names_all = getBM(attributes = c("ensembl_gene_id", "external_gene_name"), filters = "ensembl_gene_id", values = genes_all, mart = mart)
+
+res_df$gene_ids = genes_all
+res_df$gene_symbol = gene_names_all[match(res_df[,7], gene_names_all[,1]),2]
+```
+
+# Volcano Plot
+```{r}
+vol_data = data.frame(gene_name = res_df$gene_symbol, logFC = res_df$log2FoldChange, adjP = res_df$padj)
+ggplot(data = vol_data, aes(x = logFC, y = -1*log10(adjP))) + geom_point() + ylim(0,8) + xlim(-8,8)
+
+
+#Highlighting significant genes
+vol_data$sig = "not-significant"
+vol_data$sig[which((vol_data$adjP < 0.1) & (vol_data$logFC > 1))] = "up"
+vol_data$sig[which((vol_data$adjP < 0.1) & (vol_data$logFC < -1))] = "down"
+# Plotting again
+ggplot(data = vol_data, aes(x = logFC, y = -1*log10(adjP), color = sig)) + geom_point() + ylim(0,8) + xlim(-8,8) + scale_color_manual(values = c("blue", "grey", "red")) + labs(x = "log2FoldChange", y = "-log10(FDR)", title = "Volcano Plot") + geom_hline(yintercept = -log10(0.1), linetype = 4) + geom_vline(xintercept = c(-1,1), linetype = 4)
+
+
+# Labelling the top 5 most significant genes 
+vol_data$label = ""
+vol_data = vol_data[order(vol_data$adjP), ]
+up_genes = head(vol_data$gene_name[which(vol_data$sig == "up")], 5)
+down_genes = head(vol_data$gene_name[which(vol_data$sig == "down")], 5)
+
+top10 = c(as.character(up_genes), as.character(down_genes))
+vol_data$label[match(top10, vol_data$gene_name)] = top10
+
+pdf("Volcano_plot.pdf")
+ggplot(data = vol_data, aes(x = logFC, y = -1*log10(adjP), color = sig)) + geom_point() + scale_color_manual(values = c("blue", "grey", "red")) + labs(x = "log2FoldChange", y = "-log10(FDR)", title = "Volcano Plot") + geom_hline(yintercept = -log10(0.1), linetype = 4) + geom_vline(xintercept = c(-1,1), linetype = 4) + geom_text(aes(label = label)) + theme(panel.background = element_blank(), axis.title = element_text(size = 10), plot.title = element_text(hjust = 0.5))
+dev.off()
+
+pdf("Volcano_plot_adjustedaxis.pdf")
+ggplot(data = vol_data, aes(x = logFC, y = -1*log10(adjP), color = sig)) + geom_point() + ylim(0,10) + xlim(-8,8) + scale_color_manual(values = c("blue", "grey", "red")) + labs(x = "log2FoldChange", y = "-log10(FDR)", title = "Volcano Plot") + geom_hline(yintercept = -log10(0.1), linetype = 4) + geom_vline(xintercept = c(-1,1), linetype = 4) + geom_text(aes(label = label)) + theme(panel.background = element_blank(), axis.title = element_text(size = 10), plot.title = element_text(hjust = 0.5))
+dev.off() 
+```
+
+
+
